@@ -20,7 +20,7 @@ parser = argparse.ArgumentParser(description='PyTorch Transformer Language Model
 parser.add_argument('--data', type=str, default='../data/wikitext-103',
                     help='location of the data corpus')
 parser.add_argument('--dataset', type=str, default='wt103',
-                    choices=['wt103', 'lm1b', 'enwik8', 'text8'],
+                    choices=['wt103', 'lm1b', 'enwik8', 'text8', 'ptb'],
                     help='dataset name')
 parser.add_argument('--n_layer', type=int, default=12,
                     help='number of total layers')
@@ -141,6 +141,7 @@ parser.add_argument('--static-loss-scale', type=float, default=1,
 parser.add_argument('--dynamic-loss-scale', action='store_true',
                     help='Use dynamic loss scaling.  If supplied, this argument'
                     ' supersedes --static-loss-scale.')
+parser.add_argument('--noise_norm', action='store_true', help='calculate norm noise at initialization')
 args = parser.parse_args()
 args.tied = not args.not_tied
 
@@ -415,6 +416,105 @@ def evaluate(eval_iter):
 
     return total_loss / total_len
 
+def get_grads(model):
+    res = []
+    for p in model.parameters():
+        if p.requires_grad:
+            res.append(p.grad.view(-1))
+    grad_flat = torch.cat(res)
+    return grad_flat
+
+def init_noise():
+    global train_step, train_loss, best_val_loss, eval_start_time, log_start_time
+    model.train()
+    mems = tuple()
+    train_iter = tr_iter.get_varlen_iter() if args.varlen else tr_iter
+    grads = None
+    print("noise norm calc")
+    print(args.work_dir)
+    logging(args.work_dir)
+
+    n = 0
+    for batch, (data, target, seq_len) in enumerate(train_iter):
+        model.zero_grad()
+        ret = para_model(data, target, *mems)
+        loss, mems = ret[0], ret[1:]
+        loss = loss.float().mean().type_as(loss)
+        if args.fp16:
+            optimizer.backward(loss)
+        else:
+            loss.backward()
+
+
+        grad = get_grads(model).cpu()
+        if grads is None:
+            grads = grad
+        else:
+            grads = grads + grad
+        n += 1
+
+        train_loss += loss.float().item()
+        if train_step % args.log_interval == 0:
+            cur_loss = train_loss / args.log_interval
+            elapsed = time.time() - log_start_time
+            log_str = '| epoch {:3d} step {:>8d} | {:>6d} batches | lr {:.3g} ' \
+                        '| ms/batch {:5.2f} | loss {:5.2f}'.format(
+                epoch, train_step, batch+1, optimizer.param_groups[0]['lr'],
+                elapsed * 1000 / args.log_interval, cur_loss)
+            if args.dataset in ['enwik8', 'text8']:
+                log_str += ' | bpc {:9.5f}'.format(cur_loss / math.log(2))
+            else:
+                log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
+            logging(log_str)
+            train_loss = 0
+            log_start_time = time.time()
+    print(n)
+    print("done first pass")
+    # logging(n)
+    logging("done first pass")
+    torch.save(grads, args.work_dir + "grad_{}".format(n))
+
+    mean_grad = grads / n
+    noise_norms = []
+    m = 0
+    for batch, (data, target, seq_len) in enumerate(train_iter):
+        model.zero_grad()
+        ret = para_model(data, target, *mems)
+        loss, mems = ret[0], ret[1:]
+        loss = loss.float().mean().type_as(loss)
+        if args.fp16:
+            optimizer.backward(loss)
+        else:
+            loss.backward()
+
+
+        grad = get_grads(model).cpu()
+        noise_norm = (grad - mean_grad).norm()
+        noise_norms.append(noise_norm.item())
+        m += 1
+
+        train_loss += loss.float().item()
+        if train_step % args.log_interval == 0:
+            cur_loss = train_loss / args.log_interval
+            elapsed = time.time() - log_start_time
+            log_str = '| epoch {:3d} step {:>8d} | {:>6d} batches | lr {:.3g} ' \
+                        '| ms/batch {:5.2f} | loss {:5.2f}'.format(
+                epoch, train_step, batch+1, optimizer.param_groups[0]['lr'],
+                elapsed * 1000 / args.log_interval, cur_loss)
+            if args.dataset in ['enwik8', 'text8']:
+                log_str += ' | bpc {:9.5f}'.format(cur_loss / math.log(2))
+            else:
+                log_str += ' | ppl {:9.3f}'.format(math.exp(cur_loss))
+            logging(log_str)
+            train_loss = 0
+            log_start_time = time.time()
+    print(m)
+    # logging(m)
+    to_save = np.asarray(noise_norms)
+    print(to_save.shape)
+    np.save(args.work_dir + "norm_{}_{}_{}".format(args.dataset, args.batch_size, args.seed), to_save)
+
+    
 
 def train():
     # Turn on training mode which enables dropout.
@@ -532,6 +632,10 @@ best_val_loss = None
 
 log_start_time = time.time()
 eval_start_time = time.time()
+
+epoch = 0
+if args.noise_norm:
+    init_noise()
 
 # At any point you can hit Ctrl + C to break out of training early.
 try:
